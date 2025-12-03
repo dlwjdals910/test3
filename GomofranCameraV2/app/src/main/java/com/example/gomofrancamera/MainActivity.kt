@@ -63,11 +63,21 @@ class MainActivity : AppCompatActivity() {
         private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS =
-            mutableListOf (
+            mutableListOf(
                 Manifest.permission.CAMERA
             ).apply {
-                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                    add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                // 안드로이드 13 (Tiramisu) 이상 -> READ_MEDIA_IMAGES 요청
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    add(Manifest.permission.READ_MEDIA_IMAGES)
+                }
+                // 안드로이드 12 이하 -> READ_EXTERNAL_STORAGE 요청
+                else {
+                    add(Manifest.permission.READ_EXTERNAL_STORAGE)
+
+                    // 안드로이드 9 (P) 이하 -> WRITE_EXTERNAL_STORAGE 추가 요청
+                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                        add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    }
                 }
             }.toTypedArray()
 
@@ -101,8 +111,18 @@ class MainActivity : AppCompatActivity() {
         viewBinding.shutterButton.setOnClickListener { takePicture() }
 
         viewBinding.galleryButton.setOnClickListener {
-            val intent = Intent(this, AlbumActivity::class.java)
-            startActivity(intent)
+            // 1. 갤러리 권한이 있는지 확인
+            if (hasGalleryPermission()) {
+                // 권한 있으면 앨범 화면으로 이동
+                val intent = Intent(this, AlbumActivity::class.java)
+                startActivity(intent)
+            } else {
+                // 2. 권한 없으면 안내 메시지 띄우고 권한 요청
+                Toast.makeText(this, "갤러리를 열려면 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
+                ActivityCompat.requestPermissions(
+                    this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+                )
+            }
         }
 
         setupGridButton()
@@ -258,14 +278,112 @@ class MainActivity : AppCompatActivity() {
 
     // AI 분석 결과를 받아서 처리하는 함수
     private fun updateRealtimeFeedback(result: ImageAnalysisResult) {
-        // 분석 결과가 잘 들어오는지 로그로 확인
-        Log.d(TAG, "AI 분석 결과: 배경=${result.backgroundCategory}, 자세=${result.poseCategory}")
+        // 1. 로그 확인
+        Log.d(TAG, "AI 분석 중.. 배경: ${result.backgroundCategory}, 자세: ${result.poseCategory}")
 
-        // 필요하다면 화면에 텍스트로 표시 (예시)
         runOnUiThread {
-            // 예를 들어 화면 상단에 현재 상태를 작게 표시하고 싶다면:
-            // viewBinding.guideMessageText.text = "감지됨: ${result.poseCategory}"
-            // viewBinding.guideMessageText.visibility = View.VISIBLE
+            val guide = currentGuide
+            val detected = result.detectedRect
+
+            // 가이드가 없거나 사람이 감지되지 않으면 텍스트 숨김 또는 기본 메시지
+            if (guide == null || detected == null) {
+                if (guide != null && detected == null) {
+                    viewBinding.guideMessageText.visibility = View.VISIBLE
+                    viewBinding.guideMessageText.text = "사람이 보이지 않아요 🧐"
+                    viewBinding.guideMessageText.setTextColor(Color.RED)
+                } else {
+                    // 가이드가 없는 경우 텍스트 숨김 (선택사항)
+                    viewBinding.guideMessageText.visibility = View.GONE
+                }
+                return@runOnUiThread
+            }
+
+            // --- ⭐️ 여기서부터 오차 범위 체크 로직 시작 ---
+            val guideCenterX = guide.targetRect.centerX()
+            val guideCenterY = guide.targetRect.centerY()
+            val detectedCenterX = detected.centerX()
+            val detectedCenterY = detected.centerY()
+
+            // 오차 계산
+            val diffX = guideCenterX - detectedCenterX
+            val diffY = guideCenterY - detectedCenterY
+
+            val absDiffX = Math.abs(diffX)
+            val absDiffY = Math.abs(diffY)
+
+            // 오차 범위 (15%)
+            val tolerance = 0.15f
+
+            val feedbackMessage = if (absDiffX < tolerance && absDiffY < tolerance) {
+                "✅ 구도가 완벽해요! 찰칵!"
+            } else {
+                // ⭐️ [수정됨] 사진 찍는 사람이 움직여야 하는 방향 (반대로 설정)
+                if (absDiffX > absDiffY) {
+                    // 가로(X)가 더 많이 틀렸을 때
+                    if (diffX > 0) {
+                        // 상황: 가이드(중심)는 500, 사람(내위치)은 100 (왼쪽에 있음)
+                        // 해결: 카메라를 '왼쪽'으로 돌려야 사람이 중앙으로 옴
+                        "👈 카메라를 왼쪽으로 비추세요"
+                    } else {
+                        // 상황: 가이드(중심)는 500, 사람(내위치)은 900 (오른쪽에 있음)
+                        // 해결: 카메라를 '오른쪽'으로 돌려야 사람이 중앙으로 옴
+                        "👉 카메라를 오른쪽으로 비추세요"
+                    }
+                } else {
+                    // 세로(Y)가 더 많이 틀렸을 때
+                    if (diffY > 0) {
+                        // 상황: 가이드(중심)는 아래(800), 사람(내위치)은 위(200)
+                        // 해결: 카메라를 '위'로 들어야(Tilt Up) 사람이 내려옴
+                        "👆 카메라를 위쪽을 향하게 드세요"
+                    } else {
+                        // 상황: 가이드(중심)는 위(200), 사람(내위치)은 아래(800)
+                        // 해결: 카메라를 '아래'로 내려야(Tilt Down) 사람이 올라옴
+                        "👇 카메라를 아래쪽을 향하게 내리세요"
+                    }
+                }
+            }
+
+            // 화면 표시
+            viewBinding.guideMessageText.visibility = View.VISIBLE
+            viewBinding.guideMessageText.text = feedbackMessage
+
+            // 텍스트 크기 등 원상 복구 (디버그 모드 해제)
+            viewBinding.guideMessageText.textSize = 24f
+            viewBinding.guideMessageText.maxLines = 2
+
+            // 성공 시 초록색, 실패 시 빨간색/노란색
+            if (feedbackMessage.contains("완벽")) {
+                viewBinding.guideMessageText.setTextColor(Color.GREEN)
+            } else {
+                // 거의 다 왔으면(20% 이내) 노란색, 멀면 빨간색
+                if (absDiffX < 0.25f && absDiffY < 0.25f) {
+                    viewBinding.guideMessageText.setTextColor(Color.YELLOW)
+                } else {
+                    viewBinding.guideMessageText.setTextColor(Color.RED)
+                }
+            }
+        }
+    }
+
+    // (보너스) 영어를 한글로 바꿔주는 간단한 함수 추가
+    private fun translateBackground(eng: String): String {
+        return when(eng) {
+            "sea" -> "바다/물가"
+            "nature" -> "숲/자연"
+            "city" -> "도시/건물"
+            "indoor" -> "실내"
+            else -> "기타"
+        }
+    }
+
+    private fun translatePose(eng: String): String {
+        return when(eng) {
+            "full_body" -> "전신 나옴"
+            "upper_body" -> "상반신 나옴"
+            "face_only" -> "얼굴 위주"
+            "person_too_small" -> "사람이 너무 작음"
+            "no_person" -> "사람 없음"
+            else -> "분석 중..."
         }
     }
 
@@ -482,6 +600,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun hasGalleryPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 안드로이드 13 이상: 이미지 읽기 권한 체크
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
+        } else {
+            // 안드로이드 12 이하: 저장소 읽기 권한 체크
+            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {

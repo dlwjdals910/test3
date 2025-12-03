@@ -2,6 +2,7 @@ package com.example.gomofrancamera
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.RectF
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -24,7 +25,8 @@ import org.tensorflow.lite.task.vision.classifier.ImageClassifier
 data class ImageAnalysisResult(
     val backgroundCategory: String,
     val poseCategory: String,
-    val personHeightRatio: Float
+    val personHeightRatio: Float,
+    val detectedRect: RectF? // ⭐️ [추가] 감지된 사람의 위치 박스
 )
 
 /**
@@ -99,6 +101,7 @@ class ImageAnalyzer(
         // 기본값 설정
         var poseCategory = "no_person"
         var personHeightRatio = 0f
+        var detectedRect: RectF? = null
 
         // 사람이 감지되었고, 랜드마크(관절 포인트)가 있을 경우 분석 시작
         if (poseResult != null && poseResult.landmarks().isNotEmpty()) {
@@ -107,6 +110,18 @@ class ImageAnalyzer(
             // 사람의 키 비율 계산 (가장 높은 y좌표 - 가장 낮은 y좌표)
             val ys = landmarks.map { it.y() }
             personHeightRatio = (ys.maxOrNull() ?: 0f) - (ys.minOrNull() ?: 0f)
+
+            // ⭐️ [추가] 랜드마크를 기준으로 사람의 박스(Bounding Box) 계산
+            val xList = landmarks.map { it.x() }
+            val yList = landmarks.map { it.y() }
+
+            val minX = xList.minOrNull() ?: 0f
+            val maxX = xList.maxOrNull() ?: 0f
+            val minY = yList.minOrNull() ?: 0f
+            val maxY = yList.maxOrNull() ?: 0f
+
+            // 약간의 여유 공간(Padding)을 둬서 박스 생성
+            detectedRect = RectF(minX, minY, maxX, maxY)
 
             // 비율에 따라 자세 분류 (전신, 상반신, 얼굴 위주 등)
             if (personHeightRatio < 0.2f) {
@@ -133,8 +148,8 @@ class ImageAnalyzer(
         }
 
         // --- 3단계: 결과 전송 ---
-        val finalResult = ImageAnalysisResult(backgroundCategory, poseCategory, personHeightRatio)
-        listener(finalResult) // 콜백 호출
+        val finalResult = ImageAnalysisResult(backgroundCategory, poseCategory, personHeightRatio, detectedRect)
+        listener(finalResult)
 
         // [중요] 처리가 끝난 이미지는 반드시 닫아줘야 다음 프레임이 들어옵니다.
         imageProxy.close()

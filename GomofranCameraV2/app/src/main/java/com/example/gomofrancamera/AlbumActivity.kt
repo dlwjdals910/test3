@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.ContentUris
 import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
 import android.widget.Toast
@@ -22,24 +23,31 @@ class AlbumActivity : AppCompatActivity() {
     private lateinit var binding: ActivityAlbumBinding
     private lateinit var photoAdapter: PhotoAdapter
 
+    // ⭐️ 1. 안드로이드 버전에 따라 필요한 권한을 다르게 설정합니다.
+    private val requiredPermissions: Array<String>
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            // 안드로이드 13 이상
+            arrayOf(
+                Manifest.permission.READ_MEDIA_IMAGES,
+                Manifest.permission.READ_MEDIA_VIDEO
+            )
+        } else {
+            // 안드로이드 12 이하 (여기가 핵심!)
+            arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+
     private val requestPermissionsLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
-            var allGranted = true
-            permissions.entries.forEach {
-                if (!it.value) { allGranted = false }
-            }
+            // 권한 결과 확인
+            val allGranted = permissions.entries.all { it.value }
 
             if (allGranted) {
                 loadPhotosFromGallery()
             } else {
                 Toast.makeText(this, "갤러리 접근 권한을 허용해야 합니다.", Toast.LENGTH_SHORT).show()
-                finish()
+                finish() // 권한 거부 시 화면 닫기
             }
         }
-    private val REQUIRED_PERMISSIONS_GALLERY = arrayOf(
-        Manifest.permission.READ_MEDIA_IMAGES,
-        Manifest.permission.READ_MEDIA_VIDEO
-    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -48,19 +56,15 @@ class AlbumActivity : AppCompatActivity() {
 
         setupToolbar()
 
-        // ⭐️ onCreate에서는 권한이 '없을 때' 요청하는 작업만 합니다.
-        // (사진 로딩은 onResume으로 이동했습니다)
+        // 권한이 없으면 요청
         if (!allGalleryPermissionsGranted()) {
-            requestPermissionsLauncher.launch(REQUIRED_PERMISSIONS_GALLERY)
+            requestPermissionsLauncher.launch(requiredPermissions)
         }
     }
 
-    // ⭐️ 화면이 다시 보일 때마다 실행되는 함수
     override fun onResume() {
         super.onResume()
-
-        // 권한이 있다면, 갤러리를 (다시) 불러옵니다.
-        // 상세 화면에서 사진을 지우고 돌아오면 이 코드가 실행되어 목록이 갱신됩니다.
+        // 권한이 있으면 사진 불러오기
         if (allGalleryPermissionsGranted()) {
             loadPhotosFromGallery()
         }
@@ -77,7 +81,8 @@ class AlbumActivity : AppCompatActivity() {
         }
     }
 
-    private fun allGalleryPermissionsGranted() = REQUIRED_PERMISSIONS_GALLERY.all {
+    // ⭐️ 2. 권한 체크 함수도 버전에 맞게 수정된 변수를 사용하도록 변경
+    private fun allGalleryPermissionsGranted() = requiredPermissions.all {
         ContextCompat.checkSelfPermission(
             baseContext, it
         ) == PackageManager.PERMISSION_GRANTED
@@ -92,9 +97,10 @@ class AlbumActivity : AppCompatActivity() {
     }
 
     private fun loadPhotosFromGallery() {
-        val photoList = mutableListOf<Uri>()
-
+        // 이미 로딩 중이거나 데이터가 꼬이는 것을 방지하기 위해 리스트 초기화는 스레드 내부에서 처리 권장
         thread {
+            val photoList = mutableListOf<Uri>() // 스레드 내부 지역변수로 변경
+
             val projection = arrayOf(
                 MediaStore.Images.Media._ID
             )
