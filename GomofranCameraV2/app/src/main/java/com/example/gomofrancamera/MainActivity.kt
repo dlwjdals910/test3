@@ -31,7 +31,6 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
-import androidx.core.view.updatePadding
 import com.example.gomofrancamera.databinding.ActivityMainBinding
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -42,11 +41,22 @@ class MainActivity : AppCompatActivity() {
 
     // CameraX 변수
     private var imageCapture: ImageCapture? = null
+    private var imageAnalysis: ImageAnalysis? = null
     private var cameraProvider: ProcessCameraProvider? = null
     private var camera: Camera? = null
 
-    // 현재 선택된 가이드 (OverlayView 표시용)
+    // ⭐️ 팀원이 만든 새로운 AI 엔진
+    private lateinit var imageAnalyzer: ImageAnalyzer
+
+    // 현재 선택된 가이드
     private var currentGuide: GuideItem? = null
+
+    // 현재 감지된 배경/상황 정보 (자동 추천용)
+    private var currentContextTags: List<String> = emptyList()
+
+    // 자동 촬영 관련 변수
+    private var matchStartTime: Long = 0
+    private var isAutoCaptureProcessing = false
 
     private val prefs by lazy {
         getSharedPreferences("GomofranCameraPrefs", Context.MODE_PRIVATE)
@@ -63,26 +73,15 @@ class MainActivity : AppCompatActivity() {
         private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS =
-            mutableListOf(
+            mutableListOf (
                 Manifest.permission.CAMERA
             ).apply {
-                // 안드로이드 13 (Tiramisu) 이상 -> READ_MEDIA_IMAGES 요청
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    add(Manifest.permission.READ_MEDIA_IMAGES)
-                }
-                // 안드로이드 12 이하 -> READ_EXTERNAL_STORAGE 요청
-                else {
-                    add(Manifest.permission.READ_EXTERNAL_STORAGE)
-
-                    // 안드로이드 9 (P) 이하 -> WRITE_EXTERNAL_STORAGE 추가 요청
-                    if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-                        add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-                    }
+                if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
+                    add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 }
             }.toTypedArray()
 
         private const val KEY_LAST_RATIO = "last_ratio"
-
         private const val RATIO_4_3_CUSTOM = 0
         private const val RATIO_1_1_CUSTOM = 1
         private const val RATIO_16_9_CUSTOM = 2
@@ -93,9 +92,24 @@ class MainActivity : AppCompatActivity() {
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(viewBinding.root)
 
+        // ⭐️ [수정] ImageAnalyzer 생성 시 리스너(결과 처리)를 바로 정의
+        imageAnalyzer = ImageAnalyzer(this) { result ->
+            // 1. 분석 결과를 받아서 피드백 생성
+            val feedback = generateFeedback(result, currentGuide)
+
+            // 2. UI 업데이트 (메인 스레드에서 실행되도록 runOnUiThread 사용)
+            runOnUiThread {
+                updateGuideUI(feedback)
+
+                // 3. 자동 추천용 태그 저장
+                if (result.backgroundCategory.isNotEmpty()) {
+                    currentContextTags = listOf(result.backgroundCategory)
+                }
+            }
+        }
+
         setupWindowInsets()
 
-        // 저장된 비율 불러오기
         currentRatioKey = prefs.getInt(KEY_LAST_RATIO, RATIO_4_3_CUSTOM)
         updateRatioIcon(currentRatioKey)
 
@@ -111,18 +125,8 @@ class MainActivity : AppCompatActivity() {
         viewBinding.shutterButton.setOnClickListener { takePicture() }
 
         viewBinding.galleryButton.setOnClickListener {
-            // 1. 갤러리 권한이 있는지 확인
-            if (hasGalleryPermission()) {
-                // 권한 있으면 앨범 화면으로 이동
-                val intent = Intent(this, AlbumActivity::class.java)
-                startActivity(intent)
-            } else {
-                // 2. 권한 없으면 안내 메시지 띄우고 권한 요청
-                Toast.makeText(this, "갤러리를 열려면 권한이 필요합니다.", Toast.LENGTH_SHORT).show()
-                ActivityCompat.requestPermissions(
-                    this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-                )
-            }
+            val intent = Intent(this, AlbumActivity::class.java)
+            startActivity(intent)
         }
 
         setupGridButton()
@@ -158,7 +162,6 @@ class MainActivity : AppCompatActivity() {
             }
             viewBinding.flashButton.setImageResource(iconRes)
             imageCapture?.flashMode = flashMode
-
             val message = when (flashMode) {
                 ImageCapture.FLASH_MODE_ON -> "플래시 켜짐"
                 ImageCapture.FLASH_MODE_AUTO -> "플래시 자동"
@@ -189,7 +192,6 @@ class MainActivity : AppCompatActivity() {
             updateRatioIcon(currentRatioKey)
             startCamera()
         }
-        updateRatioIcon(currentRatioKey)
 
         viewBinding.switchCameraButton.setOnClickListener {
             currentCameraSelector = if (currentCameraSelector == CameraSelector.DEFAULT_BACK_CAMERA) {
@@ -203,14 +205,13 @@ class MainActivity : AppCompatActivity() {
         setupRecommendationPanel()
     }
 
-    // ⭐️ AI 관련 코드(ImageAnalysis)가 모두 제거된 startCamera
+    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
     private fun startCamera() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
             cameraProvider = cameraProviderFuture.get()
 
-            // 1. 화면 비율 설정
             val viewPortRational = when (currentRatioKey) {
                 RATIO_1_1_CUSTOM -> Rational(1, 1)
                 RATIO_16_9_CUSTOM -> Rational(9, 16)
@@ -223,23 +224,6 @@ class MainActivity : AppCompatActivity() {
                 AspectRatio.RATIO_4_3
             }
 
-            // 2. 뷰포트 설정
-            val viewPort = ViewPort.Builder(viewPortRational, viewBinding.viewFinder.display.rotation)
-                .build()
-
-            // 3. 이미지 분석기 (AI) 설정
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setTargetAspectRatio(cameraAspectRatio)
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-
-            imageAnalysis.setAnalyzer(ContextCompat.getMainExecutor(this),
-                ImageAnalyzer(this) { result ->
-                    updateRealtimeFeedback(result)
-                }
-            )
-
-            // 4. 미리보기 설정
             val preview = Preview.Builder()
                 .setTargetAspectRatio(cameraAspectRatio)
                 .build()
@@ -247,17 +231,26 @@ class MainActivity : AppCompatActivity() {
                     it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
                 }
 
-            // 5. 이미지 캡처 설정
             imageCapture = ImageCapture.Builder()
                 .setTargetAspectRatio(cameraAspectRatio)
                 .setFlashMode(flashMode)
                 .build()
 
-            // 6. 유즈케이스 그룹 생성 (중복 제거됨!)
+            // ⭐️ [수정] 분석기 설정이 아주 간단해집니다!
+            imageAnalysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+
+            // ⭐️ 우리가 만든 imageAnalyzer를 그대로 전달
+            imageAnalysis?.setAnalyzer(ContextCompat.getMainExecutor(this), imageAnalyzer)
+
+            val viewPort = ViewPort.Builder(viewPortRational, viewBinding.viewFinder.display.rotation)
+                .build()
+
             val useCaseGroup = UseCaseGroup.Builder()
                 .addUseCase(preview)
                 .addUseCase(imageCapture!!)
-                .addUseCase(imageAnalysis) // AI 분석 포함
+                .addUseCase(imageAnalysis!!)
                 .setViewPort(viewPort)
                 .build()
 
@@ -271,149 +264,115 @@ class MainActivity : AppCompatActivity() {
 
             } catch (exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
-                Toast.makeText(this, "카메라 실행 실패", Toast.LENGTH_SHORT).show()
             }
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // AI 분석 결과를 받아서 처리하는 함수
-    private fun updateRealtimeFeedback(result: ImageAnalysisResult) {
-        // 1. 로그 확인
-        Log.d(TAG, "AI 분석 중.. 배경: ${result.backgroundCategory}, 자세: ${result.poseCategory}")
+    // 분석 결과와 가이드를 비교하여 피드백 생성
+    private fun generateFeedback(analysis: ImageAnalysisResult, guide: GuideItem?): AnalysisResult {
+        if (guide == null) {
+            val info = "배경: ${analysis.backgroundCategory}, 포즈: ${analysis.poseCategory}"
+            return AnalysisResult(info, analysis.detectedRect, false)
+        }
 
-        runOnUiThread {
-            val guide = currentGuide
-            val detected = result.detectedRect
+        if (analysis.detectedRect == null) {
+            return AnalysisResult("피사체를 찾아주세요 👀", null, false)
+        }
 
-            // 가이드가 없거나 사람이 감지되지 않으면 텍스트 숨김 또는 기본 메시지
-            if (guide == null || detected == null) {
-                if (guide != null && detected == null) {
-                    viewBinding.guideMessageText.visibility = View.VISIBLE
-                    viewBinding.guideMessageText.text = "사람이 보이지 않아요 🧐"
-                    viewBinding.guideMessageText.setTextColor(Color.RED)
-                } else {
-                    // 가이드가 없는 경우 텍스트 숨김 (선택사항)
-                    viewBinding.guideMessageText.visibility = View.GONE
-                }
-                return@runOnUiThread
-            }
+        val objRect = analysis.detectedRect
+        val targetCx = guide.targetRect.centerX()
+        val targetCy = guide.targetRect.centerY()
+        val currentCx = objRect.centerX()
+        val currentCy = objRect.centerY()
 
-            // --- ⭐️ 여기서부터 오차 범위 체크 로직 시작 ---
-            val guideCenterX = guide.targetRect.centerX()
-            val guideCenterY = guide.targetRect.centerY()
-            val detectedCenterX = detected.centerX()
-            val detectedCenterY = detected.centerY()
+        val diffX = targetCx - currentCx
+        val diffY = targetCy - currentCy
 
-            // 오차 계산
-            val diffX = guideCenterX - detectedCenterX
-            val diffY = guideCenterY - detectedCenterY
+        val objArea = objRect.width() * objRect.height()
+        val targetArea = guide.targetRect.width() * guide.targetRect.height()
+        val sizeRatio = objArea / targetArea
 
-            val absDiffX = Math.abs(diffX)
-            val absDiffY = Math.abs(diffY)
+        var message = ""
+        var isMatched = false
+        val tolerance = 0.15f
 
-            // 오차 범위 (15%)
-            val tolerance = 0.15f
+        if (diffX > tolerance) message = "오른쪽으로 ➡️"
+        else if (diffX < -tolerance) message = "⬅️ 왼쪽으로"
+        else if (diffY > tolerance) message = "⬇️ 낮추세요"
+        else if (diffY < -tolerance) message = "⬆️ 올리세요"
+        else if (sizeRatio < 0.8f) message = "더 가까이 🔍"
+        else if (sizeRatio > 1.2f) message = "뒤로 가세요 🔙"
+        else {
+            message = "완벽해요! 찰칵! ✨"
+            isMatched = true
+        }
 
-            val feedbackMessage = if (absDiffX < tolerance && absDiffY < tolerance) {
-                "✅ 구도가 완벽해요! 찰칵!"
-            } else {
-                // ⭐️ [수정됨] 사진 찍는 사람이 움직여야 하는 방향 (반대로 설정)
-                if (absDiffX > absDiffY) {
-                    // 가로(X)가 더 많이 틀렸을 때
-                    if (diffX > 0) {
-                        // 상황: 가이드(중심)는 500, 사람(내위치)은 100 (왼쪽에 있음)
-                        // 해결: 카메라를 '왼쪽'으로 돌려야 사람이 중앙으로 옴
-                        "👈 카메라를 왼쪽으로 비추세요"
-                    } else {
-                        // 상황: 가이드(중심)는 500, 사람(내위치)은 900 (오른쪽에 있음)
-                        // 해결: 카메라를 '오른쪽'으로 돌려야 사람이 중앙으로 옴
-                        "👉 카메라를 오른쪽으로 비추세요"
-                    }
-                } else {
-                    // 세로(Y)가 더 많이 틀렸을 때
-                    if (diffY > 0) {
-                        // 상황: 가이드(중심)는 아래(800), 사람(내위치)은 위(200)
-                        // 해결: 카메라를 '위'로 들어야(Tilt Up) 사람이 내려옴
-                        "👆 카메라를 위쪽을 향하게 드세요"
-                    } else {
-                        // 상황: 가이드(중심)는 위(200), 사람(내위치)은 아래(800)
-                        // 해결: 카메라를 '아래'로 내려야(Tilt Down) 사람이 올라옴
-                        "👇 카메라를 아래쪽을 향하게 내리세요"
-                    }
-                }
-            }
+        return AnalysisResult(message, objRect, isMatched)
+    }
 
-            // 화면 표시
+    // UI 업데이트 및 자동 촬영
+    private fun updateGuideUI(result: AnalysisResult) {
+        if (result.message.isNotEmpty()) {
             viewBinding.guideMessageText.visibility = View.VISIBLE
-            viewBinding.guideMessageText.text = feedbackMessage
+            viewBinding.guideMessageText.text = result.message
 
-            // 텍스트 크기 등 원상 복구 (디버그 모드 해제)
-            viewBinding.guideMessageText.textSize = 24f
-            viewBinding.guideMessageText.maxLines = 2
-
-            // 성공 시 초록색, 실패 시 빨간색/노란색
-            if (feedbackMessage.contains("완벽")) {
+            if (result.isMatched) {
                 viewBinding.guideMessageText.setTextColor(Color.GREEN)
-            } else {
-                // 거의 다 왔으면(20% 이내) 노란색, 멀면 빨간색
-                if (absDiffX < 0.25f && absDiffY < 0.25f) {
-                    viewBinding.guideMessageText.setTextColor(Color.YELLOW)
-                } else {
-                    viewBinding.guideMessageText.setTextColor(Color.RED)
+
+                if (!isAutoCaptureProcessing) {
+                    if (matchStartTime == 0L) matchStartTime = System.currentTimeMillis()
+                    if (System.currentTimeMillis() - matchStartTime >= 1500) {
+                        isAutoCaptureProcessing = true
+                        viewBinding.guideMessageText.text = "찰칵! 📸"
+                        viewBinding.guideMessageText.setTextColor(Color.BLUE)
+                        triggerVibration()
+                        playShutterSound()
+                        captureImage()
+                        viewBinding.root.postDelayed({
+                            isAutoCaptureProcessing = false
+                            matchStartTime = 0L
+                        }, 2000)
+                    }
                 }
+            } else {
+                matchStartTime = 0L
+                viewBinding.guideMessageText.setTextColor(Color.BLACK)
             }
+        } else {
+            viewBinding.guideMessageText.visibility = View.GONE
+            matchStartTime = 0L
         }
+
+        viewBinding.overlayView.setDetectedRect(result.detectedRect)
     }
 
-    // (보너스) 영어를 한글로 바꿔주는 간단한 함수 추가
-    private fun translateBackground(eng: String): String {
-        return when(eng) {
-            "sea" -> "바다/물가"
-            "nature" -> "숲/자연"
-            "city" -> "도시/건물"
-            "indoor" -> "실내"
-            else -> "기타"
-        }
-    }
-
-    private fun translatePose(eng: String): String {
-        return when(eng) {
-            "full_body" -> "전신 나옴"
-            "upper_body" -> "상반신 나옴"
-            "face_only" -> "얼굴 위주"
-            "person_too_small" -> "사람이 너무 작음"
-            "no_person" -> "사람 없음"
-            else -> "분석 중..."
-        }
-    }
-
-    // ⭐️ AI 자동 추천 로직 제거된 패널 설정
+    // 추천 패널 설정
     private fun setupRecommendationPanel() {
+        // 샘플 데이터 리스트
         val sampleGuides = listOf(
-            GuideItem(R.drawable.img_ref_01, GuideType.OVAL, RectF(0.2f, 0.1f, 0.8f, 0.7f)),
-            GuideItem(R.drawable.img_ref_02, GuideType.OVAL, RectF(0.3f, 0.2f, 0.7f, 0.9f)),
-            GuideItem(R.drawable.img_ref_03, GuideType.OVAL, RectF(0.1f, 0.2f, 0.9f, 0.9f)),
-            GuideItem(R.drawable.img_ref_04, GuideType.RECT, RectF(0.1f, 0.1f, 0.9f, 0.9f)),
-            GuideItem(R.drawable.img_ref_05, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.6f)),
-            GuideItem(R.drawable.img_ref_06, GuideType.RECT, RectF(0.3f, 0.4f, 0.7f, 0.8f)),
-            GuideItem(R.drawable.img_ref_07, GuideType.OVAL, RectF(0.2f, 0.1f, 0.8f, 0.7f)),
-            GuideItem(R.drawable.img_ref_08, GuideType.OVAL, RectF(0.3f, 0.3f, 0.7f, 0.9f)),
-            GuideItem(R.drawable.img_ref_09, GuideType.RECT, RectF(0.2f, 0.1f, 0.8f, 0.9f)),
-            GuideItem(R.drawable.img_ref_10, GuideType.RECT, RectF(0.1f, 0.3f, 0.9f, 0.8f)),
-            GuideItem(R.drawable.img_ref_11, GuideType.OVAL, RectF(0.2f, 0.3f, 0.8f, 0.8f)),
-            GuideItem(R.drawable.img_ref_12, GuideType.OVAL, RectF(0.25f, 0.15f, 0.75f, 0.85f)),
-            GuideItem(R.drawable.img_ref_13, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.7f)),
-            GuideItem(R.drawable.img_ref_14, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.6f)),
-            GuideItem(R.drawable.img_ref_15, GuideType.RECT, RectF(0.3f, 0.4f, 0.7f, 0.6f))
+            GuideItem(R.drawable.img_ref_01, GuideType.OVAL, RectF(0.2f, 0.1f, 0.8f, 0.7f), listOf("Dog", "Animal")),
+            GuideItem(R.drawable.img_ref_02, GuideType.OVAL, RectF(0.3f, 0.2f, 0.7f, 0.9f), listOf("Car", "Blue")),
+            GuideItem(R.drawable.img_ref_03, GuideType.OVAL, RectF(0.1f, 0.2f, 0.9f, 0.9f), listOf("Couple", "People")),
+            GuideItem(R.drawable.img_ref_04, GuideType.RECT, RectF(0.1f, 0.1f, 0.9f, 0.9f), listOf("Building", "Scenery")),
+            GuideItem(R.drawable.img_ref_05, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.6f), listOf("Food", "Mart")),
+            GuideItem(R.drawable.img_ref_06, GuideType.RECT, RectF(0.3f, 0.4f, 0.7f, 0.8f), listOf("Dog", "Animal")),
+            GuideItem(R.drawable.img_ref_07, GuideType.OVAL, RectF(0.2f, 0.1f, 0.8f, 0.7f), listOf("Man", "White")),
+            GuideItem(R.drawable.img_ref_08, GuideType.OVAL, RectF(0.3f, 0.3f, 0.7f, 0.9f), listOf("Sunset", "Back")),
+            GuideItem(R.drawable.img_ref_09, GuideType.RECT, RectF(0.2f, 0.1f, 0.8f, 0.9f), listOf("Mirror", "Couple")),
+            GuideItem(R.drawable.img_ref_10, GuideType.RECT, RectF(0.1f, 0.3f, 0.9f, 0.8f), listOf("Flower", "Scenery")),
+            GuideItem(R.drawable.img_ref_11, GuideType.OVAL, RectF(0.2f, 0.3f, 0.8f, 0.8f), listOf("Cafe", "Drink")),
+            GuideItem(R.drawable.img_ref_12, GuideType.OVAL, RectF(0.25f, 0.15f, 0.75f, 0.85f), listOf("Night", "Street")),
+            GuideItem(R.drawable.img_ref_13, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.7f), listOf("Snow", "Winter")),
+            GuideItem(R.drawable.img_ref_14, GuideType.OVAL, RectF(0.2f, 0.2f, 0.8f, 0.6f), listOf("Glasses", "Indoor")),
+            GuideItem(R.drawable.img_ref_15, GuideType.RECT, RectF(0.3f, 0.4f, 0.7f, 0.6f), listOf("Object", "Cookie"))
         )
 
-        // 클릭 리스너: AI 분석 없이 가이드(점선)만 표시
         val onItemClick: (GuideItem?) -> Unit = { selectedGuide ->
             currentGuide = selectedGuide
             if (selectedGuide != null) {
                 viewBinding.overlayView.setGuide(selectedGuide)
                 viewBinding.guideMessageText.visibility = View.VISIBLE
-                viewBinding.guideMessageText.text = "가이드에 맞춰보세요!" // 고정 멘트
+                viewBinding.guideMessageText.text = "가이드에 맞춰보세요!"
                 viewBinding.guideMessageText.setTextColor(Color.BLACK)
             } else {
                 viewBinding.overlayView.setGuide(null)
@@ -430,7 +389,8 @@ class MainActivity : AppCompatActivity() {
             val panelWidth = 120 * resources.displayMetrics.density
 
             if (isPanelOpen) {
-                // 자동 추천 로직 제거됨
+                performAutoRecommendation(sampleGuides, onItemClick)
+
                 viewBinding.recommendationPanel.bringToFront()
                 viewBinding.panelHandle.bringToFront()
                 viewBinding.recommendationPanel.animate().translationX(0f).setDuration(200).start()
@@ -444,7 +404,43 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ... (아래 함수들은 변경 없음: setupExposureControl, updateUiForRatio, setupWindowInsets, setupGridButton, takePicture, etc.) ...
+    private fun performAutoRecommendation(originalList: List<GuideItem>, onClick: (GuideItem?) -> Unit) {
+        if (currentContextTags.isEmpty()) return
+
+        val sortedList = originalList.sortedByDescending { item ->
+            item.tags.any { tag ->
+                currentContextTags.any { detected -> detected.contains(tag, ignoreCase = true) }
+            }
+        }
+
+        val newAdapter = RecommendationAdapter(sortedList, onClick)
+        viewBinding.recommendationPanel.adapter = newAdapter
+
+        if (sortedList != originalList) {
+            Toast.makeText(this, "AI가 ${currentContextTags.first()} 구도를 추천했어요!", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun triggerVibration() {
+        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
+            vibratorManager.defaultVibrator
+        } else {
+            @Suppress("DEPRECATION")
+            getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(android.os.VibrationEffect.createOneShot(100, 150))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(100)
+        }
+    }
+
+    private fun playShutterSound() {
+        val sound = android.media.MediaActionSound()
+        sound.play(android.media.MediaActionSound.SHUTTER_CLICK)
+    }
 
     private fun setupExposureControl() {
         val cameraControl = camera?.cameraControl ?: return
@@ -538,25 +534,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takePicture() {
-        // 진동/소리 피드백 (AI 제외 버전에서도 유지)
-        fun feedback() {
-            val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val vibratorManager = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as android.os.VibratorManager
-                vibratorManager.defaultVibrator
-            } else {
-                @Suppress("DEPRECATION")
-                getSystemService(Context.VIBRATOR_SERVICE) as android.os.Vibrator
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(android.os.VibrationEffect.createOneShot(100, 150))
-            } else {
-                @Suppress("DEPRECATION")
-                vibrator.vibrate(100)
-            }
-            val sound = android.media.MediaActionSound()
-            sound.play(android.media.MediaActionSound.SHUTTER_CLICK)
-        }
-
         if (selectedTimer > 0) {
             viewBinding.countdownText.visibility = View.VISIBLE
             object : android.os.CountDownTimer((selectedTimer * 1000).toLong(), 1000) {
@@ -566,12 +543,14 @@ class MainActivity : AppCompatActivity() {
                 }
                 override fun onFinish() {
                     viewBinding.countdownText.visibility = View.GONE
-                    feedback()
+                    triggerVibration()
+                    playShutterSound()
                     captureImage()
                 }
             }.start()
         } else {
-            feedback()
+            triggerVibration()
+            playShutterSound()
             captureImage()
         }
     }
@@ -600,16 +579,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
         ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun hasGalleryPermission(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            // 안드로이드 13 이상: 이미지 읽기 권한 체크
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_MEDIA_IMAGES) == PackageManager.PERMISSION_GRANTED
-        } else {
-            // 안드로이드 12 이하: 저장소 읽기 권한 체크
-            ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED
-        }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
